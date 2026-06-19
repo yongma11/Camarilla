@@ -1,0 +1,2 @@
+total_capital,coef,fraction,use_vol_filter,vol_filter_pct,fee_rate,slippage_pct
+100000.0,0.7,1.0,True,0.8,0.0005,0.001
