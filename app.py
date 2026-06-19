@@ -1,234 +1,52 @@
 """
-카마릴라 R4 돌파매매 마스터 (Camarilla Breakout Master)
-- SOXL 카마릴라 R4 변형 돌파매매 전략의 일일 주문표 + 백테스트 Streamlit 앱
-- 동파법 마스터 v9.8 의 구조(GitHub 저장소 기반 상태 영속화, 3탭 UI)를 참고하여 제작
+동파법 마스터 v9.8 + 카마릴라 R4 돌파매매 오버레이 결합 백테스트.
 
-전략 로직 (검증된 B안 기본값):
-  저항선(R) = 전일종가 + (전일고가-전일저가) * 1.1 * coef   [coef=0.70]
-  - 장중 고가가 R을 돌파하면 매수 (시가가 이미 R 위라면 시가에 매수)
-  - 다음 거래일 시가에 전량 매도 (MOO)
-  - 직전 20일 변동성이 과거 분포 상위 (1-vol_filter_pct) 구간이면 그날은 매매 휴식
+아이디어:
+  매일 동파법이 "오늘 매수에 쓸 돈"을 먼저 다 쓰게 한 뒤, 남은 현금(real_cash)의
+  overlay_fraction(기본 70%) 만큼을 카마릴라 R4 변형 돌파전략에 투입한다.
+  카마릴라 포지션은 그 다음날 시가에 무조건 청산되어 현금이 회수되고,
+  회수된 현금은 그 다음날 동파법의 매수 자금으로 다시 쓰일 수 있다 (자본 재활용).
+
+핵심 설계 포인트 (간섭 방지):
+  - 매일 루프 순서: ① 전날 열어둔 카마릴라 포지션을 '오늘 시가'로 청산 → 현금 회수
+                    ② 동파법의 매도/매수 스텝을 원본 로직 그대로 실행 (real_cash 사용)
+                    ③ 동파법이 다 쓰고 남은 real_cash 의 overlay_fraction 만큼만
+                       오늘 신호가 있으면 카마릴라에 투입 (단일 슬롯)
+  - 따라서 동파법은 항상 '자기 몫'을 100% 먼저 가져간 �다음에만 오버레이가 남은 돈을
+    건드리므로, 오버레이가 동파법의 당일 매수 실행을 줄이는 일은 구조적으로 없다.
+  - RESET_CYCLE 가상자본 재계산은 동파법 자신의 cum_profit/cum_loss/배당만 사용
+    (카마릴라 손익은 섞지 않음 — 두 전략의 회계를 분리).
+  - overlay_enabled=False 로 두면 ①③ 스텝이 통째로 스킵되어 run_backtest_fixed 와
+    완전히 동일한 루프가 된다 (검증: verify_overlay_off.py).
 """
-
-from __future__ import annotations
-
-import io
-import math
-from datetime import datetime, date
-
 import numpy as np
 import pandas as pd
-import streamlit as st
-import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-try:
-    from github import Github
-    HAS_PYGITHUB = True
-except Exception:
-    HAS_PYGITHUB = False
-
-# ----------------------------------------------------------------------------
-# 설정값 (검증된 B안 = 기본값)
-# ----------------------------------------------------------------------------
-TICKER = "SOXL"
-DEFAULTS = dict(
-    total_capital=10_000_000.0,
-    coef=0.70,
-    fraction=1.0,
-    use_vol_filter=True,
-    vol_filter_pct=0.80,
-    fee_rate=0.0005,      # 편도 0.05%
-    slippage_pct=0.0010,  # 편도 0.10%
+from dongpa_core import (
+    load_local_data,
+    calc_mode_series, calc_qs_strength, qs_label_and_mul, loss_streak_mul,
+    LOCAL_PARAMS, MAX_SLOTS_SAFE, MAX_SLOTS_OFFENSE, RESET_CYCLE, max_slots_for,
+    QS_LOW_THRESH, QS_HIGH_THRESH, QS_HIGH_SLOT_CAP, LOSS_STREAK_WIN,
 )
 
-HOLDINGS_PATH = "camarilla_holdings.csv"
-JOURNAL_PATH = "camarilla_journal.csv"
-EQUITY_PATH = "camarilla_equity.csv"
-SETTINGS_PATH = "camarilla_settings.csv"
 
-st.set_page_config(page_title="카마릴라 R4 돌파매매 마스터", layout="wide", page_icon="📈")
-
-# ----------------------------------------------------------------------------
-# GitHub 영속화 (secrets에 GH_TOKEN / GH_REPO 가 없으면 세션 임시 저장으로 자동 폴백)
-# ----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_repo():
-    if not HAS_PYGITHUB:
-        return None
-    try:
-        token = st.secrets["GH_TOKEN"]
-        repo_name = st.secrets["GH_REPO"]
-    except Exception:
-        return None
-    try:
-        g = Github(token)
-        return g.get_repo(repo_name)
-    except Exception as e:
-        st.sidebar.error(f"GitHub 연결 실패: {e}")
-        return None
-
-
-def load_csv(path: str, default_df: pd.DataFrame, state_key: str) -> pd.DataFrame:
-    if state_key in st.session_state:
-        return st.session_state[state_key]
-    repo = get_repo()
-    if repo is not None:
-        try:
-            content = repo.get_contents(path)
-            df = pd.read_csv(io.BytesIO(content.decoded_content))
-            st.session_state[state_key] = df
-            return df
-        except Exception:
-            pass
-    st.session_state[state_key] = default_df.copy()
-    return st.session_state[state_key]
-
-
-def save_csv(path: str, df: pd.DataFrame, message: str, state_key: str):
-    st.session_state[state_key] = df.copy()
-    repo = get_repo()
-    if repo is None:
-        return  # 세션 임시 저장만 (GitHub 미연동)
-    csv_str = df.to_csv(index=False)
-    try:
-        content = repo.get_contents(path)
-        repo.update_file(path, message, csv_str, content.sha)
-    except Exception:
-        try:
-            repo.create_file(path, message, csv_str)
-        except Exception as e:
-            st.error(f"GitHub 저장 실패: {e}")
-
-
-def is_github_connected() -> bool:
-    return get_repo() is not None
-
-
-DEFAULT_HOLDINGS = pd.DataFrame([{
-    "in_position": False, "entry_date": "", "entry_price": 0.0, "qty": 0.0
-}])
-DEFAULT_JOURNAL = pd.DataFrame(columns=[
-    "date", "action", "price", "qty", "amount", "fee", "pnl", "equity_after", "note"
-])
-DEFAULT_EQUITY = pd.DataFrame(columns=["date", "equity", "note"])
-DEFAULT_SETTINGS = pd.DataFrame([DEFAULTS])
-
-
-def get_holdings():
-    return load_csv(HOLDINGS_PATH, DEFAULT_HOLDINGS, "holdings_df")
-
-
-def get_journal():
-    return load_csv(JOURNAL_PATH, DEFAULT_JOURNAL, "journal_df")
-
-
-def get_equity_log():
-    return load_csv(EQUITY_PATH, DEFAULT_EQUITY, "equity_df")
-
-
-def get_settings():
-    df = load_csv(SETTINGS_PATH, DEFAULT_SETTINGS, "settings_df")
-    row = df.iloc[0].to_dict()
-    merged = dict(DEFAULTS)
-    merged.update({k: row[k] for k in row if k in merged})
-    merged["use_vol_filter"] = bool(merged["use_vol_filter"]) if not isinstance(merged["use_vol_filter"], str) \
-        else merged["use_vol_filter"].strip().lower() in ("true", "1", "yes")
-    return merged
-
-
-def save_settings(new_settings: dict):
-    save_csv(SETTINGS_PATH, pd.DataFrame([new_settings]), "update settings", "settings_df")
-
-
-# ----------------------------------------------------------------------------
-# 데이터 로딩
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=900, show_spinner="SOXL 시세 데이터 불러오는 중...")
-def get_price_history(period: str = "max") -> tuple[pd.DataFrame, str | None]:
-    """가격 데이터를 반환. 실패 시 (빈 df, 에러메시지) 형태로 반환해 원인을 화면에 보여줄 수 있게 함."""
-    last_err = None
-    raw = None
-
-    # 1차: yf.download (threads=False — 클라우드 환경에서 더 안정적)
-    try:
-        raw = yf.download(TICKER, period=period, auto_adjust=True, progress=False, threads=False)
-        if raw is None or len(raw) == 0:
-            raw = None
-    except Exception as e:
-        last_err = f"yf.download 실패: {e!r}"
-        raw = None
-
-    # 2차: yf.Ticker(...).history (다른 내부 경로를 타서 1차가 막혀도 통과하는 경우가 있음)
-    if raw is None:
-        try:
-            raw = yf.Ticker(TICKER).history(period=period, auto_adjust=True)
-            if raw is None or len(raw) == 0:
-                raw = None
-                last_err = last_err or "Ticker.history 도 빈 데이터 반환"
-        except Exception as e:
-            last_err = f"Ticker.history 실패: {e!r}"
-            raw = None
-
-    if raw is None:
-        return pd.DataFrame(columns=["date", "O", "H", "L", "C"]), (last_err or "알 수 없는 오류")
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    raw = raw.reset_index()
-    raw = raw.rename(columns={"Date": "date", "Open": "O", "High": "H", "Low": "L", "Close": "C"})
-    raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None)
-    df = raw[["date", "O", "H", "L", "C"]].dropna().sort_values("date").reset_index(drop=True)
-    if len(df) == 0:
-        return df, "컬럼 정리 후 데이터가 0행 (티커/기간 확인 필요)"
-    return df, None
-
-
-def get_live_price() -> float | None:
-    try:
-        fi = yf.Ticker(TICKER).fast_info
-        p = fi.get("lastPrice") or fi.get("last_price")
-        return float(p) if p else None
-    except Exception:
-        return None
-
-
-# ----------------------------------------------------------------------------
-# 전략 핵심 로직
-# ----------------------------------------------------------------------------
-def compute_signal_frame(df: pd.DataFrame, coef: float) -> pd.DataFrame:
-    out = df.copy().reset_index(drop=True)
-    O, H, L, C = out["O"].values, out["H"].values, out["L"].values, out["C"].values
-    n = len(out)
+def compute_camarilla_signal(df, coef=0.70, vol_filter_pct=0.80):
+    """verify_core.py 의 compute_signal_frame / 진입-청산 로직을 그대로 가져와
+    df(SOXL_O/H/L/SOXL) 기준으로 신호·진입가·청산가·트레이드수익률을 계산한다."""
+    O = df['SOXL_O'].values
+    H = df['SOXL_H'].values
+    L = df['SOXL_L'].values
+    C = df['SOXL'].values
+    n = len(df)
     prevH = np.roll(H, 1); prevH[0] = np.nan
     prevL = np.roll(L, 1); prevL[0] = np.nan
     prevC = np.roll(C, 1); prevC[0] = np.nan
     resistance = prevC + (prevH - prevL) * 1.1 * coef
-
     ret_cc = np.zeros(n)
     ret_cc[1:] = C[1:] / C[:-1] - 1
     vol20 = pd.Series(ret_cc).rolling(20).std().values
-    vol_shift = np.roll(vol20, 1)
-    vol_shift[0] = np.nan
+    vol_shift = np.roll(vol20, 1); vol_shift[0] = np.nan
     vol_rank = pd.Series(vol_shift).expanding(min_periods=60).rank(pct=True).values
-
-    out["resistance"] = resistance
-    out["vol20"] = vol20
-    out["vol_rank"] = vol_rank
-    return out
-
-
-def run_backtest(df: pd.DataFrame, coef: float, fraction: float = 1.0,
-                  vol_filter_pct: float | None = None,
-                  fee_rate: float = 0.0, slippage_pct: float = 0.0,
-                  start_date=None, end_date=None):
-    sig = compute_signal_frame(df, coef)
-    n = len(sig)
-    O, H = sig["O"].values, sig["H"].values
-    resistance = sig["resistance"].values
-    vol_rank = sig["vol_rank"].values
-    dates = pd.to_datetime(sig["date"].values)
     nextO = np.roll(O, -1); nextO[-1] = np.nan
 
     signal = (H >= resistance) & ~np.isnan(resistance)
@@ -236,404 +54,370 @@ def run_backtest(df: pd.DataFrame, coef: float, fraction: float = 1.0,
         vol_ok = (vol_rank <= vol_filter_pct) & ~np.isnan(vol_rank)
         signal = signal & vol_ok
 
-    mask = np.ones(n, dtype=bool)
-    if start_date is not None:
-        mask &= dates >= pd.Timestamp(start_date)
-    if end_date is not None:
-        mask &= dates <= pd.Timestamp(end_date)
-
     entry_raw = np.where(O >= resistance, O, resistance)
-    entry_eff = entry_raw * (1 + slippage_pct)
-    exit_eff = nextO * (1 - slippage_pct)
-    gross_ret = exit_eff / entry_eff - 1
-    trade_ret = gross_ret - fee_rate * 2
-
-    equity = np.empty(n)
-    eq, peak, mdd = 1.0, 1.0, 0.0
-    underwater, max_underwater = 0, 0
-    trade_dates, trade_rets = [], []
-    for i in range(n):
-        if mask[i] and signal[i] and not np.isnan(trade_ret[i]):
-            r = trade_ret[i] * fraction
-            eq *= (1 + r)
-            trade_dates.append(dates[i])
-            trade_rets.append(trade_ret[i])
-        equity[i] = eq
-        if eq > peak:
-            peak = eq
-            underwater = 0
-        else:
-            underwater += 1
-            max_underwater = max(max_underwater, underwater)
-        mdd = min(mdd, eq / peak - 1)
-
-    eq_series = pd.Series(equity, index=dates)
-    trades = np.array(trade_rets)
-    valid_dates = dates[mask]
-    years = (valid_dates[-1] - valid_dates[0]).days / 365.25 if len(valid_dates) >= 2 else np.nan
-    final_eq = eq
-    cagr = final_eq ** (1 / years) - 1 if years and years > 0 and final_eq > 0 else np.nan
-    calmar = cagr / abs(mdd) if mdd < 0 and not np.isnan(cagr) else np.nan
-    win_rate = (trades > 0).mean() if len(trades) > 0 else np.nan
-    avg_win = trades[trades > 0].mean() if (trades > 0).any() else np.nan
-    avg_loss = trades[trades <= 0].mean() if (trades <= 0).any() else np.nan
-
-    stats = dict(
-        n_trades=len(trades), win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss,
-        cagr=cagr, mdd=mdd, calmar=calmar, max_underwater=max_underwater,
-        final_equity=final_eq, years=years,
-    )
-    trade_log = pd.DataFrame({"date": trade_dates, "trade_ret": trade_rets})
-    return stats, eq_series, trade_log, sig
+    return pd.DataFrame({
+        'signal': signal,
+        'entry_raw': entry_raw,
+        'nextO': nextO,
+    }, index=df.index)
 
 
-def get_today_order_info(df: pd.DataFrame, coef: float, vol_filter_pct: float | None):
-    """가장 마지막으로 완성된 거래일 데이터를 기준으로 '다음 거래일' 매수 기준가/매매가능 여부를 계산"""
-    sig = compute_signal_frame(df, coef)
-    last = sig.iloc[-1]
-    resistance_next = last["C"] + (last["H"] - last["L"]) * 1.1 * coef
-
-    # vol_rank for the NEXT trading day uses vol20 computed through `last` (today),
-    # i.e. the expanding percentile rank including the most recent completed bar
-    ret_cc = np.zeros(len(sig))
-    C = sig["C"].values
-    ret_cc[1:] = C[1:] / C[:-1] - 1
-    vol20 = pd.Series(ret_cc).rolling(20).std()
-    vol_rank_series = vol20.expanding(min_periods=60).rank(pct=True)
-    vol_rank_next_val = vol_rank_series.iloc[-1]
-    vol_ok = True if vol_filter_pct is None else (
-        (not np.isnan(vol_rank_next_val)) and vol_rank_next_val <= vol_filter_pct
-    )
-    return dict(
-        basis_date=last["date"],
-        resistance_next=float(resistance_next),
-        vol_rank_next=float(vol_rank_next_val) if not np.isnan(vol_rank_next_val) else None,
-        vol_ok=bool(vol_ok),
-        last_close=float(last["C"]),
-        last_high=float(last["H"]),
-        last_low=float(last["L"]),
-    )
-
-
-# ----------------------------------------------------------------------------
-# UI 헬퍼
-# ----------------------------------------------------------------------------
-def fmt_pct(x):
-    return "-" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x*100:.2f}%"
-
-
-def fmt_money(x):
-    return f"${x:,.2f}"
-
-
-# ============================================================================
-# 사이드바: 전략 파라미터 설정
-# ============================================================================
-st.sidebar.title("⚙️ 전략 설정")
-if is_github_connected():
-    st.sidebar.success("GitHub 저장소 연동됨 — 보유상태/거래일지가 영구 저장됩니다.")
-else:
-    st.sidebar.warning(
-        "GitHub 미연동: secrets에 GH_TOKEN / GH_REPO 를 설정하면 "
-        "보유상태/거래일지가 영구 저장됩니다. 지금은 이 브라우저 세션에서만 임시 유지됩니다."
-    )
-
-settings = get_settings()
-
-with st.sidebar.form("settings_form"):
-    total_capital = st.number_input("총 투자자금($ 또는 원)", min_value=0.0,
-                                     value=float(settings["total_capital"]), step=100000.0)
-    coef = st.slider("저항선 계수 (coef, R4=0.55, 검증된 추천=0.70)", 0.10, 1.00,
-                      float(settings["coef"]), 0.01)
-    fraction = st.slider("매수 비중 (자산 대비, B안=100%)", 0.10, 1.00,
-                          float(settings["fraction"]), 0.05)
-    use_vol_filter = st.checkbox("변동성 필터 사용 (추천)", value=bool(settings["use_vol_filter"]))
-    vol_filter_pct = st.slider("변동성 필터 임계값 (상위 N% 회피, B안=80%)", 0.50, 0.99,
-                                float(settings["vol_filter_pct"]), 0.01)
-    fee_rate = st.number_input("편도 수수료율 (%)", min_value=0.0, value=float(settings["fee_rate"]) * 100,
-                                step=0.01, format="%.3f") / 100
-    slippage_pct = st.number_input("편도 슬리피지 (%)", min_value=0.0, value=float(settings["slippage_pct"]) * 100,
-                                    step=0.01, format="%.3f") / 100
-    submitted = st.form_submit_button("설정 저장")
-    if submitted:
-        new_settings = dict(total_capital=total_capital, coef=coef, fraction=fraction,
-                             use_vol_filter=use_vol_filter, vol_filter_pct=vol_filter_pct,
-                             fee_rate=fee_rate, slippage_pct=slippage_pct)
-        save_settings(new_settings)
-        st.sidebar.success("저장 완료")
-
-st.sidebar.caption(
-    "검증된 추천값(B안): coef=0.70, 비중=100%, 변동성필터 상위20% 회피. "
-    "MDD를 -50%대에서 -25%대로 낮추면서 CAGR은 대부분 보존하는 조합으로, "
-    "4구간 분할/워크포워드 검증을 거쳤습니다."
-)
-
-eff_vol_filter_pct = vol_filter_pct if use_vol_filter else None
-
-# ============================================================================
-# 메인: 3개 탭
-# ============================================================================
-st.title("📈 카마릴라 R4 돌파매매 마스터 — SOXL")
-
-tab1, tab2, tab3 = st.tabs(["🗓️ 오늘의 주문표", "🧪 백테스트", "📖 전략 로직"])
-
-# ----------------------------------------------------------------------------
-# TAB 1: 오늘의 주문표
-# ----------------------------------------------------------------------------
-with tab1:
-    price_df, price_err = get_price_history()
-    if len(price_df) < 30:
-        st.error(f"시세 데이터를 불러오지 못했습니다.\n\n원인: {price_err}")
-        if st.button("다시 시도", key="retry_tab1"):
-            get_price_history.clear()
-            st.rerun()
+def run_combined_backtest(df, start_date, end_date, init_cap,
+                           overlay_enabled=True, overlay_fraction=0.70,
+                           coef=0.70, vol_filter_pct=0.80,
+                           cama_fee_rate=0.0005, cama_slippage_pct=0.0010,
+                           include_fees=False, include_tax=False,
+                           buy_fee_rate=0.00015, sell_fee_rate=0.0001706,
+                           tax_deduction_usd=1786.0, tax_rate=0.22,
+                           tax_strategy='A', custom_schedule=None):
+    """run_backtest_fixed 와 동일한 동파법 루프 + 카마릴라 오버레이.
+    overlay_enabled=False 이면 오버레이 관련 두 스텝(①③)이 완전히 스킵되어
+    run_backtest_fixed 와 동일한 결과를 낸다."""
+    TAX_SCHEDULES = {'A': [(1.00, (5, 1), (5, 31))]}
+    if tax_strategy == 'B' and custom_schedule is not None and len(custom_schedule) > 0:
+        tax_tranches_def = custom_schedule
     else:
-        info = get_today_order_info(price_df, coef, eff_vol_filter_pct)
-        holdings = get_holdings()
-        row0 = holdings.iloc[0]
-        in_position = bool(row0["in_position"]) if not isinstance(row0["in_position"], str) \
-            else row0["in_position"].strip().lower() in ("true", "1", "yes")
+        tax_tranches_def = TAX_SCHEDULES.get('A', [(1.00, (5, 1), (5, 31))])
+    if df is None:
+        return None, None, None, None, None
 
-        live_price = get_live_price()
+    mode_daily, rsi_daily = calc_mode_series(df['QQQ'])
+    qs_daily = calc_qs_strength(df)
+    cama_sig = compute_camarilla_signal(df, coef=coef, vol_filter_pct=vol_filter_pct)
 
-        st.caption(
-            f"기준일(마지막 완성 거래일): **{pd.Timestamp(info['basis_date']).date()}** "
-            f"(종가 {fmt_money(info['last_close'])}, 고가 {fmt_money(info['last_high'])}, 저가 {fmt_money(info['last_low'])})"
-            + (f"  ·  실시간가(참고용): {fmt_money(live_price)}" if live_price else "")
-        )
+    sim_df = pd.concat([df['SOXL'], df['SOXL_Div'], mode_daily, rsi_daily, qs_daily,
+                         cama_sig['signal'], cama_sig['entry_raw'], cama_sig['nextO']], axis=1)
+    sim_df.columns = ['Price', 'Div', 'Mode', 'RSI', 'QS', 'CamaSignal', 'CamaEntryRaw', 'CamaNextO']
+    sim_df['Div'] = sim_df['Div'].fillna(0)
+    sim_df = sim_df.dropna(subset=['Price', 'Mode', 'QS'])
+    mask = (sim_df.index >= pd.to_datetime(start_date)) & (sim_df.index <= pd.to_datetime(end_date))
+    sim_df = sim_df[mask]
+    if sim_df.empty:
+        return None, None, None, None, None
+    sim_df['Prev_Price'] = sim_df['Price'].shift(1)
+    sim_df['Prev_QS'] = sim_df['QS'].shift(1)
+    sim_df['Prev_Mode'] = sim_df['Mode'].shift(1)
+    sim_df = sim_df.dropna(subset=['Prev_Price', 'Prev_QS', 'Prev_Mode'])
 
-        col1, col2 = st.columns(2)
+    real_cash = init_cap
+    cum_profit = 0.0
+    cum_loss = 0.0
+    cum_dividends = 0.0
+    slots = []
+    equity_curve = []
+    debug_logs = []
+    cama_log = []
+    gross_profit = 0.0
+    gross_loss = 0.0
+    cycle_days = 0
+    slot_sizes = {'Safe': init_cap / MAX_SLOTS_SAFE, 'Offense': init_cap / MAX_SLOTS_OFFENSE}
+    recent_slot_outcomes = []
+    total_buy_fees = 0.0
+    total_sell_fees = 0.0
+    annual_realized = 0.0
+    total_tax_paid = 0.0
+    last_year_seen = None
+    tax_log = []
+    yearly_realized_log = {}
+    yearly_fee_log = {}
+    yearly_tax_log = {}
+    yearly_div_log = {}
+    yearly_cama_pnl_log = {}
+    pending_tranches = []
+    forced_count = 0
+    negative_cash_days = 0
 
-        # ---- 보유 현황 / 매도 주문 ----
-        with col1:
-            st.subheader("① 보유 현황 / 매도 주문")
-            if in_position:
-                st.info(
-                    f"**보유중** — 진입일 {row0['entry_date']}, 진입가 {fmt_money(float(row0['entry_price']))}, "
-                    f"수량 {row0['qty']}"
-                )
-                st.markdown("👉 **다음 거래일 시가(MOO)에 전량 매도**하세요.")
-                with st.form("sell_form"):
-                    sell_date = st.date_input("체결일", value=date.today())
-                    sell_price = st.number_input("체결가(시가)", min_value=0.0, value=float(live_price or 0.0))
-                    sell_qty = st.number_input("체결수량", min_value=0.0, value=float(row0["qty"]))
-                    sell_submit = st.form_submit_button("매도 체결 등록")
-                    if sell_submit:
-                        amount = sell_price * sell_qty
-                        fee = amount * fee_rate
-                        entry_amount = float(row0["entry_price"]) * sell_qty
-                        pnl = amount - entry_amount - fee
-                        journal = get_journal()
-                        new_row = pd.DataFrame([{
-                            "date": sell_date, "action": "SELL", "price": sell_price, "qty": sell_qty,
-                            "amount": amount, "fee": fee, "pnl": pnl, "equity_after": np.nan,
-                            "note": f"entry {row0['entry_date']}@{row0['entry_price']}"
-                        }])
-                        journal = pd.concat([journal, new_row], ignore_index=True)
-                        save_csv(JOURNAL_PATH, journal, "sell fill", "journal_df")
-                        new_holdings = pd.DataFrame([{
-                            "in_position": False, "entry_date": "", "entry_price": 0.0, "qty": 0.0
-                        }])
-                        save_csv(HOLDINGS_PATH, new_holdings, "close position", "holdings_df")
-                        eqlog = get_equity_log()
-                        last_eq = float(eqlog["equity"].iloc[-1]) if len(eqlog) else float(total_capital)
-                        new_eq = last_eq + pnl
-                        eqlog = pd.concat([eqlog, pd.DataFrame(
-                            [{"date": sell_date, "equity": new_eq, "note": "sell"}])], ignore_index=True)
-                        save_csv(EQUITY_PATH, eqlog, "equity update", "equity_df")
-                        st.success(f"매도 체결 등록 완료 (손익 {fmt_money(pnl)}).")
-                        st.rerun()
+    cama_position = None     # {'invest_amt', 'entry_date', 'entry_raw', 'next_open'}
+    cama_trade_count = 0
+    cama_win_count = 0
+    cama_total_pnl = 0.0
+
+    for date, row in sim_df.iterrows():
+        price = row['Price']
+        div_amt = float(row.get('Div', 0) or 0)
+        prev_price = row['Prev_Price']
+        prev_qs = row['Prev_QS']
+        prev_mode = row['Prev_Mode']
+        cur_year = date.year
+
+        # ── ① 전날 열어둔 카마릴라 포지션을 '오늘 시가'로 청산 ──────────
+        if overlay_enabled and cama_position is not None:
+            exit_eff = cama_position['next_open'] * (1 - cama_slippage_pct)
+            entry_eff = cama_position['entry_raw'] * (1 + cama_slippage_pct)
+            if not np.isnan(exit_eff) and entry_eff > 0:
+                gross_ret = exit_eff / entry_eff - 1
+                trade_ret = gross_ret - cama_fee_rate * 2
             else:
-                st.success("현재 보유 포지션 없음.")
-
-        # ---- 매수 신호 / 관망 ----
-        with col2:
-            st.subheader("② 다음 매수 신호")
-            st.metric("매수 기준가(저항선)", fmt_money(info["resistance_next"]))
-            if info["vol_rank_next"] is not None:
-                st.caption(f"변동성 백분위: {info['vol_rank_next']*100:.1f}% (필터 임계값 {eff_vol_filter_pct*100 if eff_vol_filter_pct else '미사용'}%)")
-
-            if in_position:
-                st.markdown("⏸ 이미 포지션 보유중이므로 신규 매수는 진행하지 않습니다.")
-            elif not info["vol_ok"]:
-                st.warning("🛑 변동성 필터 발동 — **오늘은 매매 휴식**을 권장합니다.")
-            else:
-                breakout_now = live_price is not None and live_price >= info["resistance_next"]
-                if breakout_now:
-                    st.markdown(f"🚀 **이미 기준가 돌파!** 현재가 {fmt_money(live_price)} ≥ 기준가 {fmt_money(info['resistance_next'])} → 매수 진행")
-                else:
-                    st.markdown(f"👀 **{fmt_money(info['resistance_next'])} 돌파 시 매수** (또는 시가가 이 가격 위로 갭상승 시 시가 매수)")
-
-                suggested_qty = math.floor((total_capital * fraction) / info["resistance_next"]) if info["resistance_next"] > 0 else 0
-                st.caption(f"제안 수량 (자산 {fmt_money(total_capital)} × 비중 {fraction*100:.0f}% 기준): 약 {suggested_qty}주")
-
-                with st.form("buy_form"):
-                    buy_date = st.date_input("체결일", value=date.today(), key="buy_date")
-                    buy_price = st.number_input("체결가", min_value=0.0,
-                                                 value=float(live_price or info["resistance_next"]))
-                    buy_qty = st.number_input("체결수량", min_value=0.0, value=float(suggested_qty))
-                    buy_submit = st.form_submit_button("매수 체결 등록")
-                    if buy_submit:
-                        amount = buy_price * buy_qty
-                        fee = amount * fee_rate
-                        journal = get_journal()
-                        new_row = pd.DataFrame([{
-                            "date": buy_date, "action": "BUY", "price": buy_price, "qty": buy_qty,
-                            "amount": amount, "fee": fee, "pnl": np.nan, "equity_after": np.nan,
-                            "note": "breakout entry"
-                        }])
-                        journal = pd.concat([journal, new_row], ignore_index=True)
-                        save_csv(JOURNAL_PATH, journal, "buy fill", "journal_df")
-                        new_holdings = pd.DataFrame([{
-                            "in_position": True, "entry_date": str(buy_date),
-                            "entry_price": buy_price, "qty": buy_qty
-                        }])
-                        save_csv(HOLDINGS_PATH, new_holdings, "open position", "holdings_df")
-                        st.success("매수 체결 등록 완료. 다음 거래일에 시가 매도 안내가 표시됩니다.")
-                        st.rerun()
-
-        st.divider()
-        st.subheader("거래일지")
-        journal = get_journal()
-        if len(journal):
-            st.dataframe(journal.sort_values("date", ascending=False), use_container_width=True)
-        else:
-            st.caption("아직 기록된 거래가 없습니다.")
-
-# ----------------------------------------------------------------------------
-# TAB 2: 백테스트
-# ----------------------------------------------------------------------------
-with tab2:
-    st.subheader("파라미터 백테스트")
-    price_df, price_err = get_price_history()
-    if len(price_df) < 60:
-        st.error(f"시세 데이터를 불러오지 못했습니다.\n\n원인: {price_err}")
-        if st.button("다시 시도", key="retry_tab2"):
-            get_price_history.clear()
-            st.rerun()
-    else:
-        min_d, max_d = price_df["date"].min().date(), price_df["date"].max().date()
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            bt_coef = st.slider("저항선 계수", 0.10, 1.00, float(coef), 0.01, key="bt_coef")
-            bt_fraction = st.slider("매수 비중", 0.10, 1.00, float(fraction), 0.05, key="bt_fraction")
-        with c2:
-            bt_use_vol = st.checkbox("변동성 필터 사용", value=use_vol_filter, key="bt_use_vol")
-            bt_vol_pct = st.slider("변동성 필터 임계값", 0.50, 0.99, float(vol_filter_pct), 0.01, key="bt_vol_pct")
-        with c3:
-            bt_fee = st.number_input("편도 수수료(%)", min_value=0.0, value=fee_rate * 100, step=0.01,
-                                      format="%.3f", key="bt_fee") / 100
-            bt_slip = st.number_input("편도 슬리피지(%)", min_value=0.0, value=slippage_pct * 100, step=0.01,
-                                       format="%.3f", key="bt_slip") / 100
-
-        d1, d2 = st.columns(2)
-        with d1:
-            bt_start = st.date_input("시작일", value=min_d, min_value=min_d, max_value=max_d, key="bt_start")
-        with d2:
-            bt_end = st.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d, key="bt_end")
-
-        if st.button("백테스트 실행", type="primary"):
-            stats, eq_series, trade_log, sig = run_backtest(
-                price_df, bt_coef, bt_fraction,
-                bt_vol_pct if bt_use_vol else None,
-                bt_fee, bt_slip, bt_start, bt_end,
-            )
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("CAGR", fmt_pct(stats["cagr"]))
-            m2.metric("MDD", fmt_pct(stats["mdd"]))
-            m3.metric("Calmar", f"{stats['calmar']:.2f}" if not np.isnan(stats["calmar"]) else "-")
-            m4.metric("승률", fmt_pct(stats["win_rate"]))
-            m5.metric("거래수", f"{stats['n_trades']}")
-
-            n1, n2, n3 = st.columns(3)
-            n1.metric("평균 수익 거래", fmt_pct(stats["avg_win"]))
-            n2.metric("평균 손실 거래", fmt_pct(stats["avg_loss"]))
-            n3.metric("최장 미갱신일수", f"{stats['max_underwater']}일")
-
-            dd_series = eq_series / eq_series.cummax() - 1
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
-                                 vertical_spacing=0.05, subplot_titles=("자산곡선 (로그스케일, 시작=1.0)", "낙폭(Drawdown)"))
-            fig.add_trace(go.Scatter(x=eq_series.index, y=eq_series.values, name="Equity", line=dict(color="#1f77b4")), row=1, col=1)
-            fig.update_yaxes(type="log", row=1, col=1)
-            fig.add_trace(go.Scatter(x=dd_series.index, y=dd_series.values * 100, name="Drawdown(%)",
-                                      fill="tozeroy", line=dict(color="#d62728")), row=2, col=1)
-            fig.update_layout(height=560, showlegend=False, margin=dict(t=40, b=20))
-            st.plotly_chart(fig, use_container_width=True)
-
-            yearly = eq_series.resample("YE").last()
-            yearly_ret = yearly.pct_change()
-            if len(yearly_ret):
-                yearly_ret.iloc[0] = yearly.iloc[0] / 1.0 - 1
-            yearly_df = pd.DataFrame({
-                "연도": yearly.index.year, "연말자산(시작=1.0)": yearly.values.round(3),
-                "연간수익률": (yearly_ret.values * 100).round(2)
+                trade_ret = 0.0
+            proceeds = cama_position['invest_amt'] * (1 + trade_ret)
+            pnl = proceeds - cama_position['invest_amt']
+            real_cash += proceeds
+            cama_total_pnl += pnl
+            yearly_cama_pnl_log[cur_year] = yearly_cama_pnl_log.get(cur_year, 0.0) + pnl
+            cama_trade_count += 1
+            if pnl > 0:
+                cama_win_count += 1
+            cama_log.append({
+                "진입일": cama_position['entry_date'].date(), "청산일": date.date(),
+                "투입금": f"${cama_position['invest_amt']:,.0f}",
+                "수익률": f"{trade_ret*100:+.2f}%", "손익": f"${pnl:,.2f}",
             })
-            st.subheader("연도별 성과")
-            st.dataframe(yearly_df, use_container_width=True, hide_index=True)
+            cama_position = None
 
-            st.subheader("거래 로그")
-            if len(trade_log):
-                tl = trade_log.copy()
-                tl["trade_ret_%"] = (tl["trade_ret"] * 100).round(3)
-                st.dataframe(tl[["date", "trade_ret_%"]].sort_values("date", ascending=False),
-                             use_container_width=True, height=300)
-                csv_bytes = trade_log.to_csv(index=False).encode("utf-8")
-                st.download_button("거래 로그 다운로드 (CSV)", csv_bytes, "camarilla_trade_log.csv", "text/csv")
-            else:
-                st.caption("해당 기간/조건에서 발생한 거래가 없습니다.")
+        # ── ② 동파법 본 로직 (run_backtest_fixed 와 동일) ──────────────
+        if div_amt > 0:
+            held_shares = sum(s['shares'] for s in slots)
+            if held_shares > 0:
+                div_cash = div_amt * held_shares
+                real_cash += div_cash
+                cum_dividends += div_cash
+                yearly_div_log[cur_year] = yearly_div_log.get(cur_year, 0.0) + div_cash
 
-# ----------------------------------------------------------------------------
-# TAB 3: 전략 로직 설명
-# ----------------------------------------------------------------------------
-with tab3:
-    st.markdown(
-"""
-### 전략 개요
+        if last_year_seen is not None and cur_year != last_year_seen:
+            yearly_realized_log[last_year_seen] = annual_realized
+            if include_tax:
+                annual_tax = max(0.0, annual_realized - tax_deduction_usd) * tax_rate
+                if annual_tax > 0:
+                    for entry in tax_tranches_def:
+                        if len(entry) == 4:
+                            frac, (em, ed), (fm, fd), yoff = entry
+                        else:
+                            frac, (em, ed), (fm, fd) = entry
+                            yoff = 0
+                        if yoff == -1:
+                            tax_due = annual_tax * frac
+                            actual = min(tax_due, max(0.0, real_cash))
+                            if actual > 0:
+                                real_cash -= actual
+                                total_tax_paid += actual
+                                yearly_tax_log[last_year_seen] = yearly_tax_log.get(last_year_seen, 0.0) + actual
+                                tax_log.append((date, actual, 'dec_anticipated'))
+                            remaining = tax_due - actual
+                            if remaining > 1e-6:
+                                pending_tranches.append({
+                                    'amount': remaining,
+                                    'earliest': pd.Timestamp(year=cur_year, month=1, day=1),
+                                    'force': pd.Timestamp(year=cur_year, month=1, day=31),
+                                    'paid': 0.0, 'year': last_year_seen,
+                                })
+                        else:
+                            pending_tranches.append({
+                                'amount': annual_tax * frac,
+                                'earliest': pd.Timestamp(year=cur_year, month=em, day=ed),
+                                'force': pd.Timestamp(year=cur_year, month=fm, day=fd),
+                                'paid': 0.0, 'year': last_year_seen,
+                            })
+            annual_realized = 0.0
+        last_year_seen = cur_year
 
-**카마릴라 R4 변형 돌파매매**: 전일 OHLC로 계산한 저항선을 장중에 돌파하면 매수하고, 다음 거래일
-시가(MOO)에 전량 매도하는 1일 스윙 돌파전략입니다.
+        ls_mul = loss_streak_mul(recent_slot_outcomes)
+        if prev_qs < QS_LOW_THRESH:
+            qs_label = 'Low'
+        elif prev_qs > QS_HIGH_THRESH:
+            qs_label = 'High'
+        else:
+            qs_label = 'Normal'
+        ls_label = 'ON' if ls_mul < 1.0 else '-'
+        _, qs_mul, _ = qs_label_and_mul(prev_qs)
+        effective_max = QS_HIGH_SLOT_CAP if prev_qs > QS_HIGH_THRESH else max_slots_for(prev_mode)
 
-```
-저항선 = 전일종가 + (전일고가 - 전일저가) × 1.1 × coef
-```
+        sold_idx = []
+        sold_qty_total = 0
+        sold_pnl_total = 0.0
+        for i in range(len(slots) - 1, -1, -1):
+            s = slots[i]
+            s['days'] += 1
+            rule = LOCAL_PARAMS.get(s['birth_mode'], LOCAL_PARAMS['Safe'])
+            if (price >= s['buy_price'] * rule['sell']) or (s['days'] >= rule['time']):
+                gross_rev = s['shares'] * price
+                sell_fee = gross_rev * sell_fee_rate if include_fees else 0.0
+                net_rev = gross_rev - sell_fee
+                cost_basis = s.get('cost_basis', s['shares'] * s['buy_price'])
+                prof = net_rev - cost_basis
+                real_cash += net_rev
+                total_sell_fees += sell_fee
+                yearly_fee_log[cur_year] = yearly_fee_log.get(cur_year, 0.0) + sell_fee
+                annual_realized += prof
+                if prof > 0:
+                    cum_profit += prof; gross_profit += prof
+                    recent_slot_outcomes.append(True)
+                else:
+                    cum_loss += abs(prof); gross_loss += abs(prof)
+                    recent_slot_outcomes.append(False)
+                recent_slot_outcomes = recent_slot_outcomes[-LOSS_STREAK_WIN:]
+                sold_idx.append(i)
+                sold_qty_total += s['shares']
+                sold_pnl_total += prof
+        for i in sold_idx:
+            del slots[i]
+        if sold_qty_total > 0:
+            allocated_cap = sum(s['shares'] * price for s in slots)
+            total_asset = real_cash + allocated_cap
+            balance_qty = sum(s['shares'] for s in slots)
+            debug_logs.append({
+                "날짜": date.date(), "Action": "매도", "적용 모드": prev_mode,
+                "QS신호": f"{qs_label} ({prev_qs:.3f})", "LS가드": ls_label, "최대슬롯": effective_max,
+                "종가": f"${price:.2f}", "수량": f"{-sold_qty_total:+,d}",
+                "실현손익": f"${sold_pnl_total:,.2f}", "Balance_Qty": f"{balance_qty:,d}",
+                "Total_Cash": f"${real_cash:,.0f}", "Allocated_Cap": f"${allocated_cap:,.0f}",
+                "Total_Asset": f"${total_asset:,.0f}", "Return_Pct": f"{(total_asset/init_cap-1)*100:+.2f}%",
+            })
 
-- `coef = 0.55` → 정통 카마릴라 4차 저항선(R4)
-- `coef = 0.70` → 검증을 통해 추천하는 값 (약한 가짜 돌파를 더 걸러냄)
-- 장중 고가가 저항선을 돌파하면 그 가격(또는 이미 돌파된 채 시작한 시가)에 매수
-- 익일 시가에 전량 매도
+        curr_rule = LOCAL_PARAMS.get(prev_mode, LOCAL_PARAMS['Safe'])
+        cur_slot_size = slot_sizes[prev_mode]
+        loc_price = prev_price * (1 + curr_rule['buy'])
+        if price <= loc_price and len(slots) < effective_max:
+            amt = min(real_cash, cur_slot_size * qs_mul * ls_mul)
+            shares = int(amt / loc_price)
+            if shares > 0:
+                invested = shares * price
+                buy_fee = invested * buy_fee_rate if include_fees else 0.0
+                cost_basis = invested + buy_fee
+                real_cash -= cost_basis
+                total_buy_fees += buy_fee
+                yearly_fee_log[cur_year] = yearly_fee_log.get(cur_year, 0.0) + buy_fee
+                slots.append({'buy_price': price, 'shares': shares, 'days': 0,
+                              'birth_mode': prev_mode, 'cost_basis': cost_basis})
+                allocated_cap = sum(s['shares'] * price for s in slots)
+                total_asset = real_cash + allocated_cap
+                balance_qty = sum(s['shares'] for s in slots)
+                debug_logs.append({
+                    "날짜": date.date(), "Action": "매수", "적용 모드": prev_mode,
+                    "QS신호": f"{qs_label} ({prev_qs:.3f})", "LS가드": ls_label, "최대슬롯": effective_max,
+                    "종가": f"${price:.2f}", "수량": f"+{shares:,d}",
+                    "실현손익": "$0.00", "Balance_Qty": f"{balance_qty:,d}",
+                    "Total_Cash": f"${real_cash:,.0f}", "Allocated_Cap": f"${allocated_cap:,.0f}",
+                    "Total_Asset": f"${total_asset:,.0f}", "Return_Pct": f"{(total_asset/init_cap-1)*100:+.2f}%",
+                })
 
-**장점(원 아이디어 제안자 설명)**: 기존 윌리엄스 변동성 돌파매매는 당일 시가가 나와야 매수가를 계산할 수
-있지만, 이 전략은 저항선이 **전일 종가 시점에 이미 확정**되므로 전날 밤에 다음날 주문 계획을 세울 수
-있어 수동/디스크리션 트레이더에게 유리합니다.
+        # ── ③ 동파법이 쓰고 남은 현금의 overlay_fraction 만큼 카마릴라 신규 진입 ──
+        if overlay_enabled and row['CamaSignal'] and cama_position is None:
+            next_open = row['CamaNextO']
+            entry_raw = row['CamaEntryRaw']
+            if not np.isnan(next_open) and entry_raw > 0:
+                leftover = max(0.0, real_cash)
+                invest_amt = overlay_fraction * leftover
+                if invest_amt > 1e-6:
+                    real_cash -= invest_amt
+                    cama_position = {
+                        'invest_amt': invest_amt, 'entry_date': date,
+                        'entry_raw': entry_raw, 'next_open': next_open,
+                    }
 
-### 변동성 필터 (강건성 검증을 통해 추가)
+        dongpa_equity = sum(s['shares'] * price for s in slots)
+        cama_equity = cama_position['invest_amt'] if cama_position is not None else 0.0
+        current_equity = real_cash + dongpa_equity + cama_equity
+        equity_curve.append({'Date': date, 'Equity': current_equity,
+                              'DongpaEquity': real_cash + dongpa_equity,
+                              'CamaEquity': cama_equity})
 
-직전 20일 실현변동성(종가 기준 일별수익률의 표준편차)이 그동안의 분포에서 상위 N%(기본 20%)에 해당하는
-"극단적 변동성 구간"이면, 신호가 떠도 그날은 매매를 쉽니다. 단순히 매수 비중을 줄이는 것보다 MDD를
-낮추는 데 훨씬 효과적이었습니다.
+        cycle_days += 1
+        is_cycle_end = (cycle_days >= RESET_CYCLE)
+        for tranche in pending_tranches:
+            remaining = tranche['amount'] - tranche['paid']
+            if remaining <= 1e-6:
+                continue
+            past_earliest = date >= tranche['earliest']
+            past_force = date >= tranche['force']
+            if past_force:
+                actual = remaining
+                real_cash -= actual
+                total_tax_paid += actual
+                tranche['paid'] += actual
+                yearly_tax_log[cur_year] = yearly_tax_log.get(cur_year, 0.0) + actual
+                tax_log.append((date, actual, 'force'))
+                forced_count += 1
+            elif past_earliest and is_cycle_end:
+                actual = min(remaining, max(0.0, real_cash))
+                if actual > 0:
+                    real_cash -= actual
+                    total_tax_paid += actual
+                    tranche['paid'] += actual
+                    yearly_tax_log[cur_year] = yearly_tax_log.get(cur_year, 0.0) + actual
+                    tax_log.append((date, actual, 'cycle'))
+        pending_tranches = [t for t in pending_tranches if (t['amount'] - t['paid']) > 1e-6]
+        if real_cash < 0:
+            negative_cash_days += 1
+        if is_cycle_end:
+            # ★ 동파법 자신의 cum_profit/cum_loss/배당만 사용 (카마릴라 손익 미포함)
+            virtual = init_cap + (cum_profit * 0.7) - (cum_loss * 0.6) - total_tax_paid + cum_dividends * 0.7
+            if virtual < 1000:
+                virtual = 1000
+            slot_sizes['Safe'] = virtual / MAX_SLOTS_SAFE
+            slot_sizes['Offense'] = virtual / MAX_SLOTS_OFFENSE
+            cycle_days = 0
 
-### 검증된 파라미터 (2010-2026 SOXL 데이터, 4구간 분할 + 70/30 워크포워드 검증)
+    if last_year_seen is not None:
+        yearly_realized_log.setdefault(last_year_seen, annual_realized)
+    pending_unrealized = max(0.0, annual_realized - tax_deduction_usd) * tax_rate if include_tax else 0.0
+    pending_unfunded = sum(t['amount'] - t['paid'] for t in pending_tranches)
+    pending_tax_at_end = pending_unrealized + pending_unfunded
 
-| 구분 | coef | 비중 | 변동성필터 | CAGR | MDD | Calmar |
-|---|---|---|---|---|---|---|
-| 원본 (R4, 필터없음) | 0.55 | 100% | 없음 | 82.3% | -50.9% | 1.62 |
-| A. 보수적 | 0.70 | 70% | 상위 20% 회피 | 36.8% | **-18.0%** | 2.05 |
-| **B. 균형 (기본값)** | **0.70** | **100%** | **상위 20% 회피** | **54.3%** | **-25.3%** | **2.15** |
+    res_df = pd.DataFrame(equity_curve).set_index('Date')
+    df_debug = pd.DataFrame(debug_logs).reset_index(drop=True) if debug_logs else pd.DataFrame()
+    df_cama = pd.DataFrame(cama_log) if cama_log else pd.DataFrame()
 
-저항선을 살짝 높이고(coef 0.55→0.70) 변동성 필터를 추가하는 것만으로 MDD를 50%대에서 18~25%대로
-낮추면서 CAGR은 대부분 보존했습니다. 70/30 워크포워드(미래 구간) 검증에서도 우위가 유지되어, 과적합이
-아닌 강건한 개선임을 확인했습니다.
+    if not res_df.empty:
+        res_df['Returns'] = res_df['Equity'].pct_change()
+        downside_returns = res_df.loc[res_df['Returns'] < 0, 'Returns']
+        downside_std = downside_returns.std() * np.sqrt(252)
+        total_ret = (res_df['Equity'].iloc[-1] / init_cap) - 1
+        days = (res_df.index[-1] - res_df.index[0]).days
+        cagr = (1 + total_ret) ** (365 / days) - 1 if days > 0 else 0
+        sortino = cagr / downside_std if downside_std > 0 else 0
+        peak = res_df['Equity'].cummax()
+        mdd = ((res_df['Equity'] - peak) / peak).min()
+        metrics = {
+            'cagr': cagr, 'mdd': mdd, 'calmar': (cagr / abs(mdd)) if mdd < 0 else np.nan,
+            'final_equity': res_df['Equity'].iloc[-1],
+            'profit_factor': gross_profit / gross_loss if gross_loss > 0 else 99.9,
+            'sortino': sortino,
+            'total_buy_fees': total_buy_fees, 'total_sell_fees': total_sell_fees,
+            'total_fees': total_buy_fees + total_sell_fees,
+            'total_tax_paid': total_tax_paid, 'tax_pending_end': pending_tax_at_end,
+            'tax_log': tax_log, 'include_fees': include_fees, 'include_tax': include_tax,
+            'tax_strategy': tax_strategy, 'forced_count': forced_count,
+            'negative_cash_days': negative_cash_days, 'total_dividends': cum_dividends,
+            'cama_trade_count': cama_trade_count,
+            'cama_win_rate': (cama_win_count / cama_trade_count) if cama_trade_count > 0 else np.nan,
+            'cama_total_pnl': cama_total_pnl,
+            'overlay_enabled': overlay_enabled, 'overlay_fraction': overlay_fraction,
+        }
+    else:
+        metrics = {'cagr': np.nan, 'mdd': np.nan, 'calmar': np.nan, 'final_equity': np.nan}
 
-### 남는 한계 (반드시 인지할 것)
+    yearly_stats = []
+    def calc_mdd(series):
+        peak = series.cummax()
+        return ((series - peak) / peak).min()
+    prev_equity = init_cap
+    for yr in res_df.index.year.unique():
+        df_yr = res_df[res_df.index.year == yr]
+        end_equity = df_yr['Equity'].iloc[-1]
+        yr_return = (end_equity - prev_equity) / prev_equity
+        yr_mdd = calc_mdd(df_yr['Equity'])
+        yearly_stats.append({
+            "연도": yr, "수익률": yr_return, "MDD": yr_mdd, "기말자산": end_equity,
+            "수수료": yearly_fee_log.get(yr, 0.0), "양도세": yearly_tax_log.get(yr, 0.0),
+            "실현손익": yearly_realized_log.get(yr, 0.0), "배당": yearly_div_log.get(yr, 0.0),
+            "카마릴라손익": yearly_cama_pnl_log.get(yr, 0.0),
+        })
+        prev_equity = end_equity
 
-- **단일 종목·단일 사이클 의존**: SOXL(반도체 3배 레버리지)의 2010~2026년 데이터에만 기반합니다. 다른
-  레버리지 ETF나 다른 시대에 동일하게 통할지는 검증되지 않았습니다.
-- **슬리피지/수수료**: 백테스트 탭에서 옵션으로 반영할 수 있으나, 돌파매매 특성상 실제 체결가는
-  저항선보다 불리하게 체결될 가능성이 높습니다. 슬리피지 가정을 낙관적으로 두면 실제 성과보다
-  좋게 나올 수 있습니다.
-- **변동성 필터 임계값(80%) 자체도 추정값**: 75~85% 구간에서 자산이 커지면 재점검이 필요합니다.
-- **유동성 제약 미반영**: 투자 규모가 커지면 SOXL 일일 거래량 한도에 부딪힐 수 있습니다.
-- 이 앱은 **주문 정보를 안내하고 체결 기록을 보관**하는 도구이며, 자동매매를 수행하지 않습니다. 실제
-  주문은 사용자가 직접 거래소/증권사 앱에서 실행해야 합니다.
-"""
-    )
+    return res_df, metrics, pd.DataFrame(yearly_stats).set_index("연도"), df_debug, df_cama
+
+
+if __name__ == "__main__":
+    df = load_local_data(".")
+    START, END, INIT_CAP = "2012-01-01", "2026-06-18", 10000
+
+    res_off, m_off, yr_off, dbg_off, cama_off = run_combined_backtest(
+        df, START, END, INIT_CAP, overlay_enabled=False)
+    res_on, m_on, yr_on, dbg_on, cama_on = run_combined_backtest(
+        df, START, END, INIT_CAP, overlay_enabled=True, overlay_fraction=0.70)
+
+    print("=== 동파법 단독 (overlay OFF) ===")
+    print(f"최종자산: ${m_off['final_equity']:,.0f}  CAGR: {m_off['cagr']*100:.2f}%  MDD: {m_off['mdd']*100:.2f}%  Calmar: {m_off['calmar']:.2f}")
+    print("\n=== 동파법 + 카마릴라 오버레이 (overlay ON, 70%) ===")
+    print(f"최종자산: ${m_on['final_equity']:,.0f}  CAGR: {m_on['cagr']*100:.2f}%  MDD: {m_on['mdd']*100:.2f}%  Calmar: {m_on['calmar']:.2f}")
+    print(f"카마릴라 거래수: {m_on['cama_trade_count']}  승률: {m_on['cama_win_rate']*100:.1f}%  카마릴라 누적손익: ${m_on['cama_total_pnl']:,.0f}")
