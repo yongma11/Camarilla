@@ -145,18 +145,44 @@ def save_settings(new_settings: dict):
 # ----------------------------------------------------------------------------
 # 데이터 로딩
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="SOXL 시세 데이터 불러오는 중...")
-def get_price_history(period: str = "max") -> pd.DataFrame:
-    raw = yf.download(TICKER, period=period, auto_adjust=True, progress=False)
-    if raw is None or len(raw) == 0:
-        return pd.DataFrame(columns=["date", "O", "H", "L", "C"])
+@st.cache_data(ttl=900, show_spinner="SOXL 시세 데이터 불러오는 중...")
+def get_price_history(period: str = "max") -> tuple[pd.DataFrame, str | None]:
+    """가격 데이터를 반환. 실패 시 (빈 df, 에러메시지) 형태로 반환해 원인을 화면에 보여줄 수 있게 함."""
+    last_err = None
+    raw = None
+
+    # 1차: yf.download (threads=False — 클라우드 환경에서 더 안정적)
+    try:
+        raw = yf.download(TICKER, period=period, auto_adjust=True, progress=False, threads=False)
+        if raw is None or len(raw) == 0:
+            raw = None
+    except Exception as e:
+        last_err = f"yf.download 실패: {e!r}"
+        raw = None
+
+    # 2차: yf.Ticker(...).history (다른 내부 경로를 타서 1차가 막혀도 통과하는 경우가 있음)
+    if raw is None:
+        try:
+            raw = yf.Ticker(TICKER).history(period=period, auto_adjust=True)
+            if raw is None or len(raw) == 0:
+                raw = None
+                last_err = last_err or "Ticker.history 도 빈 데이터 반환"
+        except Exception as e:
+            last_err = f"Ticker.history 실패: {e!r}"
+            raw = None
+
+    if raw is None:
+        return pd.DataFrame(columns=["date", "O", "H", "L", "C"]), (last_err or "알 수 없는 오류")
+
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
     raw = raw.reset_index()
     raw = raw.rename(columns={"Date": "date", "Open": "O", "High": "H", "Low": "L", "Close": "C"})
     raw["date"] = pd.to_datetime(raw["date"]).dt.tz_localize(None)
     df = raw[["date", "O", "H", "L", "C"]].dropna().sort_values("date").reset_index(drop=True)
-    return df
+    if len(df) == 0:
+        return df, "컬럼 정리 후 데이터가 0행 (티커/기간 확인 필요)"
+    return df, None
 
 
 def get_live_price() -> float | None:
@@ -355,9 +381,12 @@ tab1, tab2, tab3 = st.tabs(["🗓️ 오늘의 주문표", "🧪 백테스트", 
 # TAB 1: 오늘의 주문표
 # ----------------------------------------------------------------------------
 with tab1:
-    price_df = get_price_history()
+    price_df, price_err = get_price_history()
     if len(price_df) < 30:
-        st.error("시세 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
+        st.error(f"시세 데이터를 불러오지 못했습니다.\n\n원인: {price_err}")
+        if st.button("다시 시도", key="retry_tab1"):
+            get_price_history.clear()
+            st.rerun()
     else:
         info = get_today_order_info(price_df, coef, eff_vol_filter_pct)
         holdings = get_holdings()
@@ -476,9 +505,12 @@ with tab1:
 # ----------------------------------------------------------------------------
 with tab2:
     st.subheader("파라미터 백테스트")
-    price_df = get_price_history()
+    price_df, price_err = get_price_history()
     if len(price_df) < 60:
-        st.error("시세 데이터를 불러오지 못했습니다.")
+        st.error(f"시세 데이터를 불러오지 못했습니다.\n\n원인: {price_err}")
+        if st.button("다시 시도", key="retry_tab2"):
+            get_price_history.clear()
+            st.rerun()
     else:
         min_d, max_d = price_df["date"].min().date(), price_df["date"].max().date()
         c1, c2, c3 = st.columns(3)
