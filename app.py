@@ -29,6 +29,9 @@ try:
 except Exception:
     HAS_PYGITHUB = False
 
+from dongpa_core import fetch_yf_data
+from dongpa_camarilla_combo import run_combined_backtest
+
 # ----------------------------------------------------------------------------
 # 설정값 (검증된 B안 = 기본값)
 # ----------------------------------------------------------------------------
@@ -192,6 +195,18 @@ def get_live_price() -> float | None:
         return float(p) if p else None
     except Exception:
         return None
+
+
+@st.cache_data(ttl=3600, show_spinner="동파법+카마릴라 콤보용 데이터(QQQ/SOXL) 불러오는 중...")
+def get_combo_data() -> tuple[pd.DataFrame | None, str | None]:
+    """동파법 RSI 계산용 QQQ + 카마릴라/배당용 SOXL OHLC를 yfinance로 받아온다."""
+    try:
+        df = fetch_yf_data(period="max")
+        if df is None or len(df) < 250:
+            return None, "데이터가 너무 적습니다 (250 거래일 미만)."
+        return df, None
+    except Exception as e:
+        return None, f"{e!r}"
 
 
 # ----------------------------------------------------------------------------
@@ -375,7 +390,9 @@ eff_vol_filter_pct = vol_filter_pct if use_vol_filter else None
 # ============================================================================
 st.title("📈 카마릴라 R4 돌파매매 마스터 — SOXL")
 
-tab1, tab2, tab3 = st.tabs(["🗓️ 오늘의 주문표", "🧪 백테스트", "📖 전략 로직"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🗓️ 오늘의 주문표", "🧪 백테스트", "📖 전략 로직", "🔀 동파법+카마릴라 콤보"]
+)
 
 # ----------------------------------------------------------------------------
 # TAB 1: 오늘의 주문표
@@ -637,3 +654,101 @@ with tab3:
   주문은 사용자가 직접 거래소/증권사 앱에서 실행해야 합니다.
 """
     )
+
+# ----------------------------------------------------------------------------
+# TAB 4: 동파법+카마릴라 콤보 백테스트
+# ----------------------------------------------------------------------------
+with tab4:
+    st.subheader("동파법 단독 vs 동파법+카마릴라 오버레이 비교")
+    st.caption(
+        "동파법이 당일 매수에 쓰지 않고 남기는 예수금의 일부를 카마릴라 R4 돌파매매로 같이 돌립니다. "
+        "카마릴라는 다음날 시가에 무조건 청산하므로 동파법의 매수 자금을 절대 가로채지 않습니다 — "
+        "동파법이 그날 쓸 돈을 먼저 다 쓰고, '남는 돈'에서만 비중을 떼어 투입합니다."
+    )
+
+    combo_df, combo_err = get_combo_data()
+    if combo_df is None:
+        st.error(f"콤보용 데이터를 불러오지 못했습니다.\n\n원인: {combo_err}")
+        if st.button("다시 시도", key="retry_tab4"):
+            get_combo_data.clear()
+            st.rerun()
+    else:
+        min_d4, max_d4 = combo_df.index.min().date(), combo_df.index.max().date()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            combo_init_cap = st.number_input(
+                "초기자본($)", min_value=1000.0, value=10_000.0, step=1000.0, key="combo_cap"
+            )
+            overlay_on = st.checkbox("카마릴라 오버레이 사용 (켜고 끄면서 비교)", value=True, key="combo_on")
+        with c2:
+            overlay_fraction = st.slider(
+                "오버레이 투입 비중 (동파법이 남긴 예수금 대비)", 0.0, 1.00, 0.70, 0.05,
+                key="combo_frac", disabled=not overlay_on,
+            )
+            combo_coef = st.slider("카마릴라 저항선 계수", 0.10, 1.00, 0.70, 0.01, key="combo_coef")
+        with c3:
+            combo_vol_pct = st.slider("카마릴라 변동성 필터 임계값", 0.50, 0.99, 0.80, 0.01, key="combo_vol")
+
+        d1, d2 = st.columns(2)
+        with d1:
+            combo_start = st.date_input(
+                "시작일", value=max(min_d4, date(2012, 1, 1)), min_value=min_d4, max_value=max_d4, key="combo_start"
+            )
+        with d2:
+            combo_end = st.date_input("종료일", value=max_d4, min_value=min_d4, max_value=max_d4, key="combo_end")
+
+        if st.button("콤보 백테스트 실행", type="primary", key="combo_run"):
+            res, m, yr, dbg, cama = run_combined_backtest(
+                combo_df, combo_start, combo_end, combo_init_cap,
+                overlay_enabled=overlay_on, overlay_fraction=overlay_fraction,
+                coef=combo_coef, vol_filter_pct=combo_vol_pct,
+            )
+            if res is None or res.empty:
+                st.warning("해당 기간/조건에서 결과가 없습니다.")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("최종자산", fmt_money(m["final_equity"]))
+                m2.metric("CAGR", fmt_pct(m["cagr"]))
+                m3.metric("MDD", fmt_pct(m["mdd"]))
+                m4.metric("Calmar", f"{m['calmar']:.2f}" if not np.isnan(m["calmar"]) else "-")
+
+                if overlay_on:
+                    n1, n2, n3 = st.columns(3)
+                    n1.metric("카마릴라 거래수", f"{m['cama_trade_count']}")
+                    n2.metric("카마릴라 승률", fmt_pct(m["cama_win_rate"]))
+                    n3.metric("카마릴라 누적손익", fmt_money(m["cama_total_pnl"]))
+
+                dd = (res["Equity"] - res["Equity"].cummax()) / res["Equity"].cummax()
+                fig = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05,
+                    subplot_titles=("자산곡선 (로그스케일)", "낙폭(Drawdown)"),
+                )
+                fig.add_trace(go.Scatter(x=res.index, y=res["Equity"], name="Equity",
+                                          line=dict(color="#d93025" if overlay_on else "#1a73e8")), row=1, col=1)
+                fig.update_yaxes(type="log", row=1, col=1)
+                fig.add_trace(go.Scatter(x=dd.index, y=dd.values * 100, name="Drawdown(%)",
+                                          fill="tozeroy", line=dict(color="#d62728")), row=2, col=1)
+                fig.update_layout(height=560, showlegend=False, margin=dict(t=40, b=20))
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("연도별 성과")
+                yr_disp = yr.reset_index()  # '연도'가 index로 들어와 있으므로 컬럼으로 복원
+                yr_disp["수익률"] = (yr_disp["수익률"] * 100).round(2)
+                yr_disp["MDD"] = (yr_disp["MDD"] * 100).round(2)
+                yr_disp["기말자산"] = yr_disp["기말자산"].round(0)
+                yr_disp["카마릴라손익"] = yr_disp["카마릴라손익"].round(0)
+                st.dataframe(
+                    yr_disp[["연도", "수익률", "MDD", "기말자산", "카마릴라손익"]],
+                    use_container_width=True, hide_index=True,
+                )
+
+                csv_bytes = res.reset_index().to_csv(index=False).encode("utf-8")
+                st.download_button("자산곡선 다운로드 (CSV)", csv_bytes, "combo_equity.csv", "text/csv",
+                                    key="combo_dl")
+
+        st.caption(
+            "※ 동파법 RSI 계산엔 본래 2005년부터의 QQQ 데이터가 쓰였으나, 여기서는 yfinance에서 받을 수 있는 "
+            "전체 기간을 그대로 사용합니다. 2012년 이전 구간은 RSI 워밍업이 짧아 정확도가 떨어질 수 있으니 "
+            "시작일을 2012-01-01 이후로 두는 것을 권장합니다."
+        )
