@@ -67,12 +67,19 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                            coef=0.70, vol_filter_pct=0.80,
                            cama_fee_rate=0.0005, cama_slippage_pct=0.0010,
                            include_fees=False, include_tax=False,
+                           cama_include_tax=False,
                            buy_fee_rate=0.00015, sell_fee_rate=0.0001706,
                            tax_deduction_usd=1786.0, tax_rate=0.22,
                            tax_strategy='A', custom_schedule=None):
     """run_backtest_fixed 와 동일한 동파법 루프 + 카마릴라 오버레이.
     overlay_enabled=False 이면 오버레이 관련 두 스텝(①③)이 완전히 스킵되어
-    run_backtest_fixed 와 동일한 결과를 낸다."""
+    run_backtest_fixed 와 동일한 결과를 낸다.
+
+    include_tax: 동파법 자신의 실현손익에 양도세를 매길지 여부.
+    cama_include_tax: 카마릴라 실현손익도 (동파법과 합산해서) 같은 해외주식 양도세
+        풀에 넣을지 여부. 둘 다 False면 기존(세금 없음)과 완전히 동일.
+        둘 중 하나만 켜면 그 쪽 손익만 과세 대상이 되고, 둘 다 켜면 실제
+        세법처럼 두 전략의 손익을 합산해서 연 1회 과세한다."""
     TAX_SCHEDULES = {'A': [(1.00, (5, 1), (5, 31))]}
     if tax_strategy == 'B' and custom_schedule is not None and len(custom_schedule) > 0:
         tax_tranches_def = custom_schedule
@@ -115,6 +122,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
     total_buy_fees = 0.0
     total_sell_fees = 0.0
     annual_realized = 0.0
+    annual_realized_tax = 0.0
     total_tax_paid = 0.0
     last_year_seen = None
     tax_log = []
@@ -139,6 +147,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
         prev_qs = row['Prev_QS']
         prev_mode = row['Prev_Mode']
         cur_year = date.year
+        cama_pnl_for_tax = 0.0
 
         # ── ① 전날 열어둔 카마릴라 포지션을 '오늘 시가'로 청산 ──────────
         if overlay_enabled and cama_position is not None:
@@ -153,6 +162,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
             pnl = proceeds - cama_position['invest_amt']
             real_cash += proceeds
             cama_total_pnl += pnl
+            cama_pnl_for_tax = pnl
             yearly_cama_pnl_log[cur_year] = yearly_cama_pnl_log.get(cur_year, 0.0) + pnl
             cama_trade_count += 1
             if pnl > 0:
@@ -175,8 +185,8 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
 
         if last_year_seen is not None and cur_year != last_year_seen:
             yearly_realized_log[last_year_seen] = annual_realized
-            if include_tax:
-                annual_tax = max(0.0, annual_realized - tax_deduction_usd) * tax_rate
+            if include_tax or cama_include_tax:
+                annual_tax = max(0.0, annual_realized_tax - tax_deduction_usd) * tax_rate
                 if annual_tax > 0:
                     for entry in tax_tranches_def:
                         if len(entry) == 4:
@@ -208,7 +218,13 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                                 'paid': 0.0, 'year': last_year_seen,
                             })
             annual_realized = 0.0
+            annual_realized_tax = 0.0
         last_year_seen = cur_year
+        if cama_include_tax:
+            # 카마릴라 청산손익도 동파법과 같은 해외주식 양도세 풀에 합산
+            # (위 ①에서 계산한 pnl을 연도 롤오버 처리가 끝난 뒤에 더해야
+            #  새해 첫날 거래분이 직전 연도 세금 계산에 섞이지 않는다)
+            annual_realized_tax += cama_pnl_for_tax
 
         ls_mul = loss_streak_mul(recent_slot_outcomes)
         if prev_qs < QS_LOW_THRESH:
@@ -238,6 +254,8 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                 total_sell_fees += sell_fee
                 yearly_fee_log[cur_year] = yearly_fee_log.get(cur_year, 0.0) + sell_fee
                 annual_realized += prof
+                if include_tax:
+                    annual_realized_tax += prof
                 if prof > 0:
                     cum_profit += prof; gross_profit += prof
                     recent_slot_outcomes.append(True)
@@ -349,7 +367,8 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
 
     if last_year_seen is not None:
         yearly_realized_log.setdefault(last_year_seen, annual_realized)
-    pending_unrealized = max(0.0, annual_realized - tax_deduction_usd) * tax_rate if include_tax else 0.0
+    pending_unrealized = (max(0.0, annual_realized_tax - tax_deduction_usd) * tax_rate
+                          if (include_tax or cama_include_tax) else 0.0)
     pending_unfunded = sum(t['amount'] - t['paid'] for t in pending_tranches)
     pending_tax_at_end = pending_unrealized + pending_unfunded
 
@@ -376,6 +395,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
             'total_fees': total_buy_fees + total_sell_fees,
             'total_tax_paid': total_tax_paid, 'tax_pending_end': pending_tax_at_end,
             'tax_log': tax_log, 'include_fees': include_fees, 'include_tax': include_tax,
+            'cama_include_tax': cama_include_tax,
             'tax_strategy': tax_strategy, 'forced_count': forced_count,
             'negative_cash_days': negative_cash_days, 'total_dividends': cum_dividends,
             'cama_trade_count': cama_trade_count,
