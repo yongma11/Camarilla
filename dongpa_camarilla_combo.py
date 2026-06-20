@@ -123,7 +123,9 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
     total_sell_fees = 0.0
     annual_realized = 0.0
     annual_realized_tax = 0.0
+    annual_dongpa_tax_base = 0.0  # annual_realized_tax 중 '동파법 귀속분'만 (대칭 보정용)
     total_tax_paid = 0.0
+    total_tax_paid_for_virtual = 0.0  # 가상자본 계산에 쓰는 '동파법 귀속' 세금만 누적
     last_year_seen = None
     tax_log = []
     yearly_realized_log = {}
@@ -187,6 +189,15 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
             yearly_realized_log[last_year_seen] = annual_realized
             if include_tax or cama_include_tax:
                 annual_tax = max(0.0, annual_realized_tax - tax_deduction_usd) * tax_rate
+                # 합산 세액 중 '동파법 귀속분' 비율. cama_include_tax=False 면 항상 1.0
+                # (annual_dongpa_tax_base == annual_realized_tax 이므로 기존 동작과 100% 동일).
+                # 둘 다 켜져 있을 때만 의미가 생기며, 음수 비대칭(한쪽 손실)으로 비율이
+                # [0,1] 밖으로 튀는 극단적 케이스를 막기 위해 클램프한다.
+                if annual_tax > 0 and annual_realized_tax != 0:
+                    dongpa_share = annual_dongpa_tax_base / annual_realized_tax
+                    dongpa_share = min(1.0, max(0.0, dongpa_share))
+                else:
+                    dongpa_share = 1.0
                 if annual_tax > 0:
                     for entry in tax_tranches_def:
                         if len(entry) == 4:
@@ -200,6 +211,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                             if actual > 0:
                                 real_cash -= actual
                                 total_tax_paid += actual
+                                total_tax_paid_for_virtual += actual * dongpa_share
                                 yearly_tax_log[last_year_seen] = yearly_tax_log.get(last_year_seen, 0.0) + actual
                                 tax_log.append((date, actual, 'dec_anticipated'))
                             remaining = tax_due - actual
@@ -208,17 +220,18 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                                     'amount': remaining,
                                     'earliest': pd.Timestamp(year=cur_year, month=1, day=1),
                                     'force': pd.Timestamp(year=cur_year, month=1, day=31),
-                                    'paid': 0.0, 'year': last_year_seen,
+                                    'paid': 0.0, 'year': last_year_seen, 'dongpa_share': dongpa_share,
                                 })
                         else:
                             pending_tranches.append({
                                 'amount': annual_tax * frac,
                                 'earliest': pd.Timestamp(year=cur_year, month=em, day=ed),
                                 'force': pd.Timestamp(year=cur_year, month=fm, day=fd),
-                                'paid': 0.0, 'year': last_year_seen,
+                                'paid': 0.0, 'year': last_year_seen, 'dongpa_share': dongpa_share,
                             })
             annual_realized = 0.0
             annual_realized_tax = 0.0
+            annual_dongpa_tax_base = 0.0
         last_year_seen = cur_year
         if cama_include_tax:
             # 카마릴라 청산손익도 동파법과 같은 해외주식 양도세 풀에 합산
@@ -256,6 +269,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                 annual_realized += prof
                 if include_tax:
                     annual_realized_tax += prof
+                    annual_dongpa_tax_base += prof
                 if prof > 0:
                     cum_profit += prof; gross_profit += prof
                     recent_slot_outcomes.append(True)
@@ -341,6 +355,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                 actual = remaining
                 real_cash -= actual
                 total_tax_paid += actual
+                total_tax_paid_for_virtual += actual * tranche.get('dongpa_share', 1.0)
                 tranche['paid'] += actual
                 yearly_tax_log[cur_year] = yearly_tax_log.get(cur_year, 0.0) + actual
                 tax_log.append((date, actual, 'force'))
@@ -350,6 +365,7 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
                 if actual > 0:
                     real_cash -= actual
                     total_tax_paid += actual
+                    total_tax_paid_for_virtual += actual * tranche.get('dongpa_share', 1.0)
                     tranche['paid'] += actual
                     yearly_tax_log[cur_year] = yearly_tax_log.get(cur_year, 0.0) + actual
                     tax_log.append((date, actual, 'cycle'))
@@ -357,8 +373,11 @@ def run_combined_backtest(df, start_date, end_date, init_cap,
         if real_cash < 0:
             negative_cash_days += 1
         if is_cycle_end:
-            # ★ 동파법 자신의 cum_profit/cum_loss/배당만 사용 (카마릴라 손익 미포함)
-            virtual = init_cap + (cum_profit * 0.7) - (cum_loss * 0.6) - total_tax_paid + cum_dividends * 0.7
+            # ★ 동파법 자신의 cum_profit/cum_loss/배당만 사용 (카마릴라 손익 미포함).
+            #   세금은 total_tax_paid_for_virtual(= 합산세액 중 동파법 귀속분만)을 써서,
+            #   카마릴라가 낸 세금 때문에 동파법 슬롯 크기가 부당하게 깎이지 않게 한다.
+            #   (cama_include_tax=False 면 dongpa_share가 항상 1.0이라 기존 동작과 동일)
+            virtual = init_cap + (cum_profit * 0.7) - (cum_loss * 0.6) - total_tax_paid_for_virtual + cum_dividends * 0.7
             if virtual < 1000:
                 virtual = 1000
             slot_sizes['Safe'] = virtual / MAX_SLOTS_SAFE
