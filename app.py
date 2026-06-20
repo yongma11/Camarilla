@@ -690,20 +690,45 @@ with tab4:
         with c3:
             combo_vol_pct = st.slider("카마릴라 변동성 필터 임계값", 0.50, 0.99, 0.80, 0.01, key="combo_vol")
 
+        st.markdown("**수수료 / 양도세 옵션** (체크한 항목만 '세후' 시나리오에 반영되며, '세전' 시나리오는 비교를 위해 항상 같이 계산합니다)")
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            combo_include_fees = st.checkbox("동파법 매매수수료 적용", value=False, key="combo_fees")
+        with t2:
+            combo_include_tax = st.checkbox("동파법 양도세 적용 (해외주식 양도세)", value=False, key="combo_tax")
+        with t3:
+            combo_cama_tax = st.checkbox(
+                "카마릴라 양도세도 적용 (동파법과 합산 과세)", value=False,
+                key="combo_cama_tax", disabled=not overlay_on,
+            )
+
         d1, d2 = st.columns(2)
         with d1:
             combo_start = st.date_input(
-                "시작일", value=max(min_d4, date(2012, 1, 1)), min_value=min_d4, max_value=max_d4, key="combo_start"
+                "시작일", value=max(min_d4, date(2010, 1, 1)), min_value=min_d4, max_value=max_d4, key="combo_start"
             )
         with d2:
             combo_end = st.date_input("종료일", value=max_d4, min_value=min_d4, max_value=max_d4, key="combo_end")
 
         if st.button("콤보 백테스트 실행", type="primary", key="combo_run"):
-            res, m, yr, dbg, cama = run_combined_backtest(
-                combo_df, combo_start, combo_end, combo_init_cap,
-                overlay_enabled=overlay_on, overlay_fraction=overlay_fraction,
-                coef=combo_coef, vol_filter_pct=combo_vol_pct,
-            )
+            any_tax_or_fee = combo_include_fees or combo_include_tax or combo_cama_tax
+            with st.spinner("백테스트 실행 중..."):
+                res, m, yr, dbg, cama = run_combined_backtest(
+                    combo_df, combo_start, combo_end, combo_init_cap,
+                    overlay_enabled=overlay_on, overlay_fraction=overlay_fraction,
+                    coef=combo_coef, vol_filter_pct=combo_vol_pct,
+                    include_fees=combo_include_fees, include_tax=combo_include_tax,
+                    cama_include_tax=combo_cama_tax,
+                )
+                if any_tax_or_fee:
+                    res0, m0, yr0, dbg0, cama0 = run_combined_backtest(
+                        combo_df, combo_start, combo_end, combo_init_cap,
+                        overlay_enabled=overlay_on, overlay_fraction=overlay_fraction,
+                        coef=combo_coef, vol_filter_pct=combo_vol_pct,
+                        include_fees=False, include_tax=False, cama_include_tax=False,
+                    )
+                else:
+                    res0, m0, yr0, dbg0, cama0 = res, m, yr, dbg, cama
             if res is None or res.empty:
                 st.warning("해당 기간/조건에서 결과가 없습니다.")
             else:
@@ -747,8 +772,61 @@ with tab4:
                 st.download_button("자산곡선 다운로드 (CSV)", csv_bytes, "combo_equity.csv", "text/csv",
                                     key="combo_dl")
 
+                if any_tax_or_fee:
+                    st.divider()
+                    st.subheader("세전 vs 세후 비교")
+                    eq_diff = m0["final_equity"] - m["final_equity"]
+                    eq_diff_pct = (eq_diff / m0["final_equity"] * 100) if m0["final_equity"] else np.nan
+                    comp_df = pd.DataFrame({
+                        "구분": ["세전 (수수료·양도세 미적용)", "세후 (선택 옵션 적용)"],
+                        "최종자산": [fmt_money(m0["final_equity"]), fmt_money(m["final_equity"])],
+                        "CAGR": [fmt_pct(m0["cagr"]), fmt_pct(m["cagr"])],
+                        "MDD": [fmt_pct(m0["mdd"]), fmt_pct(m["mdd"])],
+                        "Calmar": [f"{m0['calmar']:.2f}" if not np.isnan(m0["calmar"]) else "-",
+                                   f"{m['calmar']:.2f}" if not np.isnan(m["calmar"]) else "-"],
+                        "총수수료": [fmt_money(m0.get("total_fees", 0.0)), fmt_money(m.get("total_fees", 0.0))],
+                        "총양도세": [fmt_money(m0.get("total_tax_paid", 0.0)), fmt_money(m.get("total_tax_paid", 0.0))],
+                    })
+                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                    st.caption(
+                        f"수수료/양도세로 인한 최종자산 감소: {fmt_money(eq_diff)} "
+                        f"({eq_diff_pct:.2f}%) · 세후 누적 양도세 {fmt_money(m.get('total_tax_paid', 0.0))} "
+                        + (f"(미정산 추정분 {fmt_money(m.get('tax_pending_end', 0.0))} 포함 전)"
+                           if m.get('tax_pending_end', 0.0) > 0 else "")
+                    )
+
+                st.divider()
+                st.subheader("상세 매매로그")
+                log1, log2 = st.columns(2)
+                with log1:
+                    with st.expander(f"동파법 매매로그 보기 ({len(dbg) if dbg is not None else 0}건)"):
+                        if dbg is not None and len(dbg):
+                            st.dataframe(dbg.sort_values("날짜", ascending=False),
+                                         use_container_width=True, height=400)
+                            st.download_button(
+                                "동파법 매매로그 다운로드 (CSV)",
+                                dbg.to_csv(index=False).encode("utf-8"),
+                                "dongpa_trade_log.csv", "text/csv", key="combo_dbg_dl",
+                            )
+                        else:
+                            st.caption("기록된 매매가 없습니다.")
+                with log2:
+                    with st.expander(f"카마릴라 매매로그 보기 ({len(cama) if cama is not None else 0}건)"):
+                        if cama is not None and len(cama):
+                            st.dataframe(cama.sort_values("진입일", ascending=False),
+                                         use_container_width=True, height=400)
+                            st.download_button(
+                                "카마릴라 매매로그 다운로드 (CSV)",
+                                cama.to_csv(index=False).encode("utf-8"),
+                                "camarilla_trade_log.csv", "text/csv", key="combo_cama_dl",
+                            )
+                        else:
+                            st.caption("카마릴라 거래 기록이 없습니다 (오버레이 OFF 또는 신호 없음).")
+
         st.caption(
             "※ 동파법 RSI 계산엔 본래 2005년부터의 QQQ 데이터가 쓰였으나, 여기서는 yfinance에서 받을 수 있는 "
-            "전체 기간을 그대로 사용합니다. 2012년 이전 구간은 RSI 워밍업이 짧아 정확도가 떨어질 수 있으니 "
-            "시작일을 2012-01-01 이후로 두는 것을 권장합니다."
+            "전체 기간을 그대로 사용합니다. SOXL은 2010년 상장이라 데이터가 그 이후부터 시작되며, 2010년 "
+            "초반 구간은 RSI/QS 워밍업이 짧아 정확도가 다소 떨어질 수 있다는 점을 참고하세요. "
+            "양도세는 한국 해외주식 양도소득세(기본공제 후 22%, 익년 5월 납부)를 단순화해 반영한 것으로 "
+            "실제 세무 처리와 다를 수 있으니 참고용으로만 활용하세요."
         )
